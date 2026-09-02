@@ -123,7 +123,7 @@ choose_capture_source() {
         --text="What do you want to record?" \
         --column="" --column="ID" --column="Source" \
         --hide-column=2 --print-column=2 \
-        --width=560 --height=260 \
+        --width=560 --height=460 \
         "${rows[@]}"); then
         return 130
     fi
@@ -140,7 +140,7 @@ choose_audio_sources() {
         --text="Audio to record (leave unchecked for silent video):" \
         --column="Record" --column="ID" --column="Source" \
         --hide-column=2 --print-column=2 --separator="|" \
-        --width=520 --height=220 \
+        --width=520 --height=320 \
         FALSE system "System audio (what you hear)" \
         FALSE mic "Microphone"); then
         return 130
