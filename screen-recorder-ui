@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="Screen Recorder"
+GSR_BIN="${GSR_BIN:-gpu-screen-recorder}"
+VIDEO_DIR="$HOME/Videos"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/screen-recorder-ui"
+PID_FILE="$STATE_DIR/pid"
+OUTPUT_FILE_STATE="$STATE_DIR/output"
+LOG_FILE="$STATE_DIR/gpu-screen-recorder.log"
+
+mkdir -p "$STATE_DIR"
+
+have_display() {
+    [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]
+}
+
+notify() {
+    if command -v notify-send >/dev/null 2>&1 && have_display; then
+        local args=("$@")
+        if (( ${#args[@]} > 1 )); then
+            args[1]=${args[1]//\\n/$'\n'}
+        fi
+        notify-send -a "$APP_NAME" "${args[@]}" || true
+    fi
+}
+
+alert() {
+    local message="$1"
+    if command -v zenity >/dev/null 2>&1 && have_display; then
+        zenity --error --title="$APP_NAME" --text="$message" || true
+    else
+        printf '%s\n' "$message" >&2
+        notify "$APP_NAME" "$message"
+    fi
+}
+
+question() {
+    local message="$1"
+    if command -v zenity >/dev/null 2>&1 && have_display; then
+        zenity --question --title="$APP_NAME" --text="$message"
+    else
+        return 1
+    fi
+}
+
+recording_pid() {
+    [[ -s "$PID_FILE" ]] || return 1
+
+    local pid
+    pid=$(<"$PID_FILE")
+    pid=${pid//$'\n'/}
+    pid=${pid//$'\r'/}
+
+    if [[ "$pid" =~ ^[0-9]+$ ]] \
+        && kill -0 "$pid" 2>/dev/null \
+        && ps -p "$pid" -o args= 2>/dev/null | grep -q '[g]pu-screen-recorder'; then
+        printf '%s\n' "$pid"
+        return 0
+    fi
+
+    rm -f "$PID_FILE" "$OUTPUT_FILE_STATE"
+    return 1
+}
+
+stop_recording() {
+    local pid output
+    if ! pid=$(recording_pid); then
+        notify "$APP_NAME" "No screen recording is running."
+        return 0
+    fi
+
+    output=$(cat "$OUTPUT_FILE_STATE" 2>/dev/null || true)
+    notify "$APP_NAME" "Stopping recording…${output:+\nSaving to: $output}"
+
+    if ! kill -INT "$pid" 2>/dev/null; then
+        alert "Couldn't stop gpu-screen-recorder process $pid."
+        rm -f "$PID_FILE" "$OUTPUT_FILE_STATE"
+        return 1
+    fi
+
+    for _ in {1..80}; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    notify "$APP_NAME" "Recording is still stopping. It should save shortly."
+}
+
+require_ui() {
+    if ! command -v zenity >/dev/null 2>&1; then
+        alert "zenity is required for the recorder UI."
+        exit 1
+    fi
+
+    if ! command -v "$GSR_BIN" >/dev/null 2>&1; then
+        alert "gpu-screen-recorder was not found."
+        exit 1
+    fi
+}
+
+choose_capture_source() {
+    local rows=()
+
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+        rows+=(TRUE portal "Screen / window / region (portal picker)")
+        if [[ -n "${SWAYSOCK:-}" ]] && command -v swaymsg >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && command -v slurp >/dev/null 2>&1; then
+            rows+=(FALSE slurp "Window rectangle (slurp)")
+        fi
+    else
+        rows+=(TRUE focused "Focused window (X11)")
+        rows+=(FALSE screen "Whole screen (X11)")
+    fi
+
+    rows+=(FALSE webcam "Webcam")
+
+    local choice
+    if ! choice=$(zenity \
+        --list --radiolist \
+        --title="$APP_NAME" \
+        --text="What do you want to record?" \
+        --column="" --column="ID" --column="Source" \
+        --hide-column=2 --print-column=2 \
+        --width=560 --height=260 \
+        "${rows[@]}"); then
+        return 130
+    fi
+
+    [[ -n "$choice" ]] || return 130
+    printf '%s\n' "$choice"
+}
+
+choose_audio_sources() {
+    local choices
+    if ! choices=$(zenity \
+        --list --checklist \
+        --title="$APP_NAME" \
+        --text="Audio to record (leave unchecked for silent video):" \
+        --column="Record" --column="ID" --column="Source" \
+        --hide-column=2 --print-column=2 --separator="|" \
+        --width=520 --height=220 \
+        FALSE system "System audio (what you hear)" \
+        FALSE mic "Microphone"); then
+        return 130
+    fi
+
+    printf '%s\n' "$choices"
+}
+
+choose_webcam_device() {
+    local devices=()
+    mapfile -t devices < <("$GSR_BIN" --list-v4l2-devices 2>/dev/null | awk -F'|' '!seen[$1]++ { print $1 }')
+
+    case "${#devices[@]}" in
+        0)
+            alert "No webcam devices were found by gpu-screen-recorder."
+            return 1
+            ;;
+        1)
+            printf '%s\n' "${devices[0]}"
+            ;;
+        *)
+            local rows=() first=TRUE device choice
+            for device in "${devices[@]}"; do
+                rows+=("$first" "$device" "$device")
+                first=FALSE
+            done
+
+            if ! choice=$(zenity \
+                --list --radiolist \
+                --title="$APP_NAME" \
+                --text="Choose webcam:" \
+                --column="" --column="Device" --column="Name" \
+                --hide-column=2 --print-column=2 \
+                --width=520 --height=260 \
+                "${rows[@]}"); then
+                return 130
+            fi
+            [[ -n "$choice" ]] || return 130
+            printf '%s\n' "$choice"
+            ;;
+    esac
+}
+
+coord_for_geometry() {
+    local value="$1"
+    if [[ "$value" == -* ]]; then
+        printf '%s' "$value"
+    else
+        printf '+%s' "$value"
+    fi
+}
+
+select_sway_window_region() {
+    local selection coords wh x y
+    if ! selection=$(swaymsg -t get_tree \
+        | jq -r '.. | select(.pid? and .visible?) | "\(.rect.x+.window_rect.x),\(.rect.y+.window_rect.y) \(.window_rect.width)x\(.window_rect.height)"' \
+        | slurp); then
+        return 130
+    fi
+
+    [[ -n "$selection" ]] || return 130
+    coords=${selection%% *}
+    wh=${selection#* }
+    x=${coords%,*}
+    y=${coords#*,}
+
+    printf '%s%s%s\n' "$wh" "$(coord_for_geometry "$x")" "$(coord_for_geometry "$y")"
+}
+
+make_output_path() {
+    local prefix="$1"
+    mkdir -p "$VIDEO_DIR"
+    printf '%s/%s-%s.mp4\n' "$VIDEO_DIR" "$prefix" "$(date +'%Y-%m-%d_%H-%M-%S')"
+}
+
+start_recording() {
+    require_ui
+
+    local existing_pid
+    if existing_pid=$(recording_pid); then
+        if question "A recording is already running (PID $existing_pid). Stop it now?"; then
+            stop_recording
+        fi
+        exit 0
+    fi
+
+    local source prefix fps output
+    if ! source=$(choose_capture_source); then
+        exit 0
+    fi
+
+    local capture_args=()
+    prefix="screen-recording"
+    fps=60
+
+    case "$source" in
+        portal)
+            capture_args=(-w portal)
+            prefix="screen-recording"
+            fps=60
+            ;;
+        slurp)
+            local region
+            if ! region=$(select_sway_window_region); then
+                exit 0
+            fi
+            capture_args=(-w region -region "$region")
+            prefix="window-region-recording"
+            fps=60
+            ;;
+        webcam)
+            local device
+            if ! device=$(choose_webcam_device); then
+                exit 1
+            fi
+            capture_args=(-w "$device")
+            prefix="webcam-recording"
+            fps=30
+            ;;
+        focused)
+            capture_args=(-w focused -s 0x0)
+            prefix="window-recording"
+            fps=60
+            ;;
+        screen)
+            capture_args=(-w screen)
+            prefix="screen-recording"
+            fps=60
+            ;;
+        *)
+            alert "Unknown capture source: $source"
+            exit 1
+            ;;
+    esac
+
+    local audio_sources audio_args=() selected=() item
+    if ! audio_sources=$(choose_audio_sources); then
+        exit 0
+    fi
+
+    IFS='|' read -r -a selected <<< "$audio_sources"
+    for item in "${selected[@]}"; do
+        case "$item" in
+            system) audio_args+=(-a default_output) ;;
+            mic) audio_args+=(-a default_input) ;;
+        esac
+    done
+
+    output=$(make_output_path "$prefix")
+
+    local cmd=("$GSR_BIN" "${capture_args[@]}" -f "$fps" -v no "${audio_args[@]}" -o "$output")
+
+    nohup "$0" __run "$output" "${cmd[@]}" >"$LOG_FILE" 2>&1 &
+}
+
+run_supervisor() {
+    local output="$1"
+    shift
+
+    mkdir -p "$STATE_DIR"
+
+    "$@" &
+    local pid=$!
+
+    printf '%s\n' "$pid" >"$PID_FILE"
+    printf '%s\n' "$output" >"$OUTPUT_FILE_STATE"
+
+    notify "$APP_NAME" "Recording started. Press the Stop media key to save.${output:+\n$output}"
+
+    trap 'kill -INT "$pid" 2>/dev/null || true' INT TERM
+
+    set +e
+    wait "$pid"
+    local status=$?
+    set -e
+
+    rm -f "$PID_FILE" "$OUTPUT_FILE_STATE"
+
+    if [[ "$status" -eq 0 && -s "$output" ]]; then
+        notify "$APP_NAME" "Recording saved:\n$output"
+    elif [[ -s "$output" ]]; then
+        notify "$APP_NAME" "Recording ended with status $status, but a video was saved:\n$output"
+    else
+        rm -f "$output"
+        notify "$APP_NAME" "Recording cancelled or failed. See log:\n$LOG_FILE"
+    fi
+
+    exit "$status"
+}
+
+case "${1:-start}" in
+    start)
+        start_recording
+        ;;
+    stop)
+        stop_recording
+        ;;
+    toggle)
+        if recording_pid >/dev/null; then
+            stop_recording
+        else
+            start_recording
+        fi
+        ;;
+    __run)
+        shift
+        run_supervisor "$@"
+        ;;
+    *)
+        printf 'Usage: %s [start|stop|toggle]\n' "$0" >&2
+        exit 2
+        ;;
+esac
